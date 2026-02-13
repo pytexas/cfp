@@ -1,11 +1,10 @@
-Add project specification for meetup-cfp platform
+Add TDD implementation plan and todo tracker
 
-Comprehensive spec covering the multi-meetup CFP tool: Django backend
-with HTMX/Tailwind/Alpine.js frontend, 5-tier permission model
-(Read/Reviewer/Write/Admin/Super-Admin), dynamic form assembly for
-multi-meetup submissions, submission lifecycle with review and
-post-acceptance tracking, and Docker Compose deployment.
+19-step incremental build plan for the meetup-cfp platform, broken into
+small TDD prompts (RED/GREEN/REFACTOR) designed for execute-plan. Covers
+project scaffolding through Docker deployment, with test factories,
+permission integration tests, and business logic validation at each step.
 
 ## Files Added
-- spec.md - Full project specification with data models, submission flow, permissions, dashboards, and deployment config
-- .ai-sessions/session-20260213-1031-meetup-cfp-spec.md - Brainstorming session summary
+- plan.md - Detailed step-by-step implementation plan with code-gen prompts for each phase
+- todo.md - Checkbox tracker mirroring the plan (103 sub-steps)
