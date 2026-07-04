@@ -8,6 +8,9 @@ The system provides role-based dashboards for meetup organizers to review, manag
 The public surface is intentionally minimal: submission forms only, no event listings or talk history.
 All communication with speakers happens outside the platform; the app tracks status and notes.
 
+The application is built as a Temporal application: every submission target is owned by a durable workflow that enforces the status state machine, and each meetup can register a webhook endpoint that receives lifecycle notifications.
+See the Temporal Architecture section.
+
 ## Available Tooling
 
 This is a Django/Python project.
@@ -17,7 +20,8 @@ All Python work in this repo uses the `python:python` skill: uv for package and 
 
 | Layer | Technology |
 |-------|-----------|
-| Backend | Django 5.2 LTS (supported until April 2028; Django 6.0 exists, see Open Questions #9) |
+| Backend | Django 6.0 (Python 3.12+) |
+| Orchestration | Temporal (self-hosted server, `temporalio` Python SDK) |
 | Frontend | Tailwind CSS 4.x via `django-tailwind-cli` 4.x (bundled standalone CLI, no Node.js), HTMX 2.x, Alpine.js 3.x |
 | Database | SQLite (development), PostgreSQL 16 (production) |
 | Auth | `django-allauth` 65.x (Django auth + GitHub & Google OAuth) |
@@ -31,8 +35,13 @@ Stack notes:
 - `django-allauth` 65.x requires `allauth.account.middleware.AccountMiddleware` in `MIDDLEWARE` and configures providers via `SOCIALACCOUNT_PROVIDERS`.
 - `django-tailwind-cli` 4.2+ supports Tailwind CSS 4.x only; Tailwind 4 uses CSS-based configuration, so no `tailwind.config.js` is needed.
 - All `hx-*` attributes used in this spec are valid HTMX 2.x syntax.
+- `django-allauth` 65.x supports Django 6.0.
+- Temporal: development uses `temporal server start-dev`; production runs a self-hosted Temporal server in Docker Compose, sharing the PostgreSQL instance.
+- Workflow code must be deterministic; all database and network side effects live in activities.
+  Workflow definitions and activity definitions live in separate modules because the Python SDK sandbox reloads workflow files on every execution.
 - Timezone handling: `USE_TZ = True`, all datetimes stored in UTC, and one org-wide display timezone via the `TIME_ZONE` setting.
   CFP window checks compare against timezone-aware `now()`.
+  Document this behavior (UTC storage, single display timezone) in the project README.
 
 ## Django Project Structure
 
@@ -42,15 +51,16 @@ Stack notes:
 
 | App | Responsibility |
 |-----|---------------|
-| `core` | Organization settings, global form field configuration, base models/mixins |
-| `meetups` | Meetup models, branding, events, CFP window configuration, archival |
-| `submissions` | Proposals, custom questions, form rendering, file uploads, withdrawal |
-| `reviews` | Voting, notes, communication tracking, status management |
+| `core` | Organization settings, global form field configuration, base models/mixins, Temporal worker entrypoint (`run_worker` management command) |
+| `meetups` | Meetup models, branding, events, CFP window configuration, archival, webhook configuration and delivery activities |
+| `submissions` | Proposals, custom questions, form rendering, file uploads, withdrawal, submission intake workflow |
+| `reviews` | Voting, notes, communication tracking, status management, submission lifecycle workflow |
 | `users` | Auth integration, role/permission models, per-meetup role assignment |
 | `dashboard` | Admin views, reporting, filtering, export (CSV/JSON), warnings |
 
 App boundary rule: `reviews` and `dashboard` may import from `submissions` and `meetups`; `submissions` may import from `meetups` and `core`; nothing imports from `dashboard`.
 Cross-app writes go through model methods or service functions owned by the app that owns the model.
+Each app that owns Temporal code keeps workflow definitions in `workflows.py` and activities in `activities.py`.
 
 ## Data Model
 
@@ -82,6 +92,9 @@ Each meetup belongs to the organization and has its own identity and configurati
 - `cfp_mode`: enum (`year_round`, `time_boxed`)
 - `cfp_open_date`: datetime (nullable, for time-boxed mode)
 - `cfp_close_date`: datetime (nullable, for time-boxed mode)
+- `grace_period_minutes`: integer (default 0; minutes past `cfp_close_date` during which submissions are still accepted)
+- `webhook_url`: URL (optional; endpoint for lifecycle notifications, see Webhook Notifications)
+- `webhook_secret`: string (optional; HMAC-SHA256 signing key for webhook payloads)
 - `created_at`: datetime
 - `updated_at`: datetime
 
@@ -93,6 +106,8 @@ Each meetup belongs to the organization and has its own identity and configurati
 - Validation: `time_boxed` mode requires both `cfp_open_date` and `cfp_close_date`, with open strictly before close.
   `year_round` mode ignores both dates.
 - A CFP is open when `is_active` is true and either mode is `year_round`, or `cfp_open_date <= now() < cfp_close_date`.
+- `grace_period_minutes` applies at submit time only: the public form stops rendering at `cfp_close_date`, but a submission already in flight is accepted until `cfp_close_date + grace_period_minutes`.
+- When `webhook_url` is set, submission lifecycle events for this meetup (including its special events) POST to it.
 
 ### Event (Special Event)
 
@@ -105,6 +120,7 @@ Events are time-boxed CFPs under a meetup with their own submission pool.
 - `date`: date (event date)
 - `cfp_open_date`: datetime
 - `cfp_close_date`: datetime
+- `grace_period_minutes`: integer (default 0; same submit-time grace semantics as Meetup)
 - `is_archived`: boolean
 - `created_at`: datetime
 
@@ -290,8 +306,10 @@ Internal notes per submission per meetup.
   Fields labeled as headshots accept image types only.
 - Violations re-render the form with a field-level error naming the limit that was exceeded.
 
-**Access control:** uploaded files are never served directly by nginx to the public.
-Media URLs route through an authenticated Django view that checks the requester has at least Read role on a meetup the submission targets (or is a super-admin), then hands the file to nginx via `X-Accel-Redirect` from an `internal` location.
+**Access control:** files uploaded to headshot-labeled fields are public.
+Nginx serves them directly at stable media URLs so meetup announcement tooling can embed them.
+All other uploaded files are never served directly by nginx to the public.
+Their media URLs route through an authenticated Django view that checks the requester has at least Read role on a meetup the submission targets (or is a super-admin), then hands the file to nginx via `X-Accel-Redirect` from an `internal` location.
 Unauthenticated requests get a redirect to login; authenticated requests without a qualifying role get 403.
 
 ## Submission Lifecycle
@@ -337,6 +355,7 @@ The normative transition table (a transition not listed here is rejected with a 
 Rules:
 
 - All status transitions are manual and require Write role or above, except speaker withdrawal via token (see below).
+- A transition is delivered to the target's `SubmissionLifecycleWorkflow` as a Temporal Update; the update validator enforces this table (see Temporal Architecture).
 - Every transition writes a `StatusChange` row, including bulk actions (one row per submission-meetup).
 - `scheduled_date` must be set in the same operation that moves status to "Scheduled"; attempting the transition without a date is a validation error.
 - Moving from Scheduled back to Speaker Accepted clears `scheduled_date`.
@@ -351,6 +370,7 @@ Rules:
 - Withdrawal tokens never expire; they are valid as long as the submission exists.
 - A speaker can withdraw from any status except Presented and Withdrawn; those entries render disabled.
 - Speaker-initiated withdrawal writes a `StatusChange` row with `changed_by = null`.
+- The withdrawal view delivers the transition as a `request_transition` Update to each selected target's lifecycle workflow, like any other transition.
 - An unknown or malformed token returns 404.
 - Withdrawing from all meetups effectively withdraws the entire submission; the records are retained.
 
@@ -360,7 +380,76 @@ When a speaker submits, the system checks for an existing `SubmissionMeetup` row
 
 - A match blocks the submission: the form re-renders with an error naming the conflicting meetup(s)/event(s), and no records are created (all-or-nothing, including on multi-submit).
 - The check is per target, so the same talk CAN be submitted to different meetups (that is the intended multi-submit behavior), and to a meetup's default CFP and one of its events independently.
-- Withdrawn rows still count as duplicates (re-submission after withdrawal requires organizer involvement; see Open Questions #7).
+- Withdrawn rows are excluded from the duplicate check.
+  Withdraw-and-resubmit is the supported way for a speaker to revise a talk, so the same title may be submitted again to a target it was withdrawn from.
+
+## Temporal Architecture
+
+Django is the web and read layer; every write to a submission's lifecycle flows through a Temporal workflow executed by a dedicated worker service.
+PostgreSQL remains the read model: dashboards, filters, and exports query the mirrored `status` column, never the workflows.
+
+### Workflows
+
+| Workflow | Type | Workflow ID | Responsibility |
+|----------|------|-------------|----------------|
+| `SubmissionIntakeWorkflow` | short-lived | `intake-{submission_uuid}` | Persist all records for a new submission, start lifecycle workflows, fire `submission.received` webhooks |
+| `SubmissionLifecycleWorkflow` | entity (long-running) | `lifecycle-{submission_meetup_id}` | Own the status state machine for one `SubmissionMeetup` row |
+
+Deterministic workflow IDs double as idempotency keys: a duplicate start of the same intake or lifecycle workflow is a no-op.
+
+### Intake Flow
+
+1. The Django view validates the form: fields, CAPTCHA, duplicates, CFP windows (including grace period).
+2. On success it starts `SubmissionIntakeWorkflow` and waits for the result before rendering the confirmation page.
+3. The workflow runs one activity that creates the `Submission`, `SubmissionMeetup`, `SubmissionFieldResponse`, and `FileUpload` rows in a single database transaction.
+4. It then starts one `SubmissionLifecycleWorkflow` per `SubmissionMeetup` row and schedules a `submission.received` webhook delivery per target meetup with a configured `webhook_url`.
+
+### Lifecycle Workflows
+
+```mermaid
+flowchart LR
+    D[Dashboard action or withdrawal view] -->|"Update: request_transition(new_status, actor, scheduled_date)"| W[SubmissionLifecycleWorkflow]
+    W --> V{Validator: legal per transition table?}
+    V -->|no| E[Validation error returned to caller, nothing written]
+    V -->|yes| A1[Activity: write status + StatusChange row]
+    A1 --> P[(PostgreSQL read model)]
+    A1 --> A2[Activity: deliver webhook, retried with backoff]
+```
+
+- One `SubmissionLifecycleWorkflow` instance per `SubmissionMeetup` row.
+- Status transitions arrive as a Temporal Update: `request_transition(new_status, actor, scheduled_date)`.
+- The update validator enforces the normative transition table and the `scheduled_date` rules.
+  Rejected updates never enter workflow history; the caller receives the validation error synchronously and no audit row is written.
+- An accepted transition executes activities in order: write the new status and the `StatusChange` audit row to PostgreSQL, then schedule the webhook delivery.
+- Current status is exposed via a workflow Query for debugging, but application reads go to PostgreSQL.
+- Terminal statuses (Presented, Withdrawn) complete the workflow.
+- History size is bounded by the transition count (a few dozen events at most), so continue-as-new is not required.
+
+### Bulk Actions and Atomicity
+
+Bulk status changes validate every selected row against the transition table before sending any Update.
+If any row fails, nothing is sent, preserving the all-or-nothing contract.
+A row whose status changes between validation and delivery is rejected by that workflow's update validator; the bulk response reports it as an error alongside the rows that applied.
+
+### Worker and Code Layout
+
+- One `worker` service (same image as `web`) runs `manage.py run_worker`, polling task queue `cfp-main`.
+- Workflow definitions live in `workflows.py` and activities in `activities.py` inside the owning app: `submissions` for intake, `reviews` for lifecycle, `meetups` for webhook delivery.
+  Workflow modules import activities through `workflow.unsafe.imports_passed_through()` and contain nothing else.
+- Activities are synchronous functions using the Django ORM, executed on a thread pool (`activity_executor`).
+- Development runs against `temporal server start-dev`; production runs a self-hosted Temporal server in Docker Compose.
+
+### Webhook Notifications
+
+- Configured per meetup via `webhook_url` and optional `webhook_secret`.
+  Event submissions fire the parent meetup's webhook.
+- Events: `submission.received` (new submission targets the meetup) and `submission.status_changed` (every applied transition, including speaker withdrawal).
+- Payload: JSON with `event`, `meetup` slug, `event_slug` (nullable), `submission` (id, title, speaker name), `old_status` / `new_status` (status changes only), and an ISO 8601 `occurred_at` timestamp.
+  Speaker email is not included.
+- When `webhook_secret` is set, the request carries an `X-CFP-Signature` header: hex HMAC-SHA256 of the request body.
+- Delivery is a Temporal activity with a retry policy (exponential backoff, attempts capped at roughly 24 hours).
+  Delivery failure never blocks or rolls back the transition itself.
+- No delivery log table; Temporal event history is the delivery record.
 
 ## Permission Model
 
@@ -464,6 +553,10 @@ The public surface is minimal: submission forms only.
 A CFP can close, a meetup can be deactivated, or an event can be archived between form render and form submit.
 Server-side validation is authoritative: the submit is rejected with a form error explaining which target closed, and no records are created for any target (all-or-nothing).
 
+The deadline edge is softened by `grace_period_minutes` (per meetup and per event, default 0).
+Submit-time validation treats a time-boxed CFP as open until `cfp_close_date + grace_period_minutes`, so a speaker who loaded the form before the deadline can still submit shortly after it.
+Deactivation and archival have no grace period.
+
 ## Dashboard (Authenticated)
 
 All dashboard pages require login via `django-allauth`.
@@ -539,8 +632,8 @@ The multi-submit form is the most interactive part of the public UI.
    - CAPTCHA valid.
    - No duplicate (normalized email + title + target).
    - All selected CFPs still open (race condition contract above).
-7. On success: create `Submission` + `SubmissionMeetup` records + `SubmissionFieldResponse`/`FileUpload` records in one transaction.
-   Display confirmation with withdrawal link.
+7. On success: start `SubmissionIntakeWorkflow`, which creates the `Submission` + `SubmissionMeetup` + `SubmissionFieldResponse`/`FileUpload` records in one transaction and starts the lifecycle workflows (see Temporal Architecture).
+   The view waits for the workflow result, then displays confirmation with the withdrawal link.
 
 ### HTMX Endpoint
 
@@ -552,7 +645,7 @@ The multi-submit form is the most interactive part of the public UI.
 ### Alpine.js
 
 Alpine.js is reserved for client-only UI state that needs no server round-trip: the "Select All" checkbox behavior, collapsible question groups, and the file-input re-select notice.
-If implementation shows HTMX plus vanilla JS covers these, drop Alpine (Open Questions #1).
+Decided: Alpine.js stays in the stack (Open Questions #1).
 
 ## Export
 
@@ -571,8 +664,11 @@ If implementation shows HTMX plus vanilla JS covers these, drop Alpine (Open Que
 | Service | Image/Build |
 |---------|------------|
 | `web` | Django app (Gunicorn) |
+| `worker` | Same image as `web`, runs the Temporal worker (`manage.py run_worker`) |
+| `temporal` | Temporal server (`temporalio/auto-setup`, shares the PostgreSQL instance) |
+| `temporal-ui` | Temporal Web UI (not publicly exposed; operator access only) |
 | `db` | PostgreSQL 16 |
-| `nginx` | Nginx (reverse proxy, static files, media via `X-Accel-Redirect`) |
+| `nginx` | Nginx (reverse proxy, static files, public headshots, authenticated media via `X-Accel-Redirect`) |
 
 ### Volumes
 
@@ -584,6 +680,7 @@ If implementation shows HTMX plus vanilla JS covers these, drop Alpine (Open Que
 
 - Tailwind CSS is built at image build time (`manage.py tailwind build`).
 - The `web` entrypoint runs `migrate` and `collectstatic --noinput` before starting Gunicorn.
+- The `worker` entrypoint waits for the Temporal server and for migrations to complete, then starts the worker.
 
 ### Environment Configuration
 
@@ -594,6 +691,9 @@ If implementation shows HTMX plus vanilla JS covers these, drop Alpine (Open Que
 - `CAPTCHA_SITE_KEY` / `CAPTCHA_SECRET_KEY`: CAPTCHA provider keys.
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`: GitHub OAuth.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`: Google OAuth.
+- `TEMPORAL_ADDRESS`: Temporal server `host:port` (`temporal:7233` in Compose, `localhost:7233` in development).
+- `TEMPORAL_NAMESPACE`: Temporal namespace (default `default`).
+- `TEMPORAL_TASK_QUEUE`: task queue name (default `cfp-main`).
 - `DEBUG`: boolean, false in production.
 - `TIME_ZONE`: org display timezone (default `America/Chicago`).
 
@@ -605,6 +705,8 @@ uv run python manage.py migrate
 uv run python manage.py seed_global_fields  # Creates default global form fields
 uv run python manage.py createsuperuser
 uv run python manage.py tailwind build
+temporal server start-dev              # separate terminal
+uv run python manage.py run_worker     # separate terminal
 uv run python manage.py runserver
 ```
 
@@ -617,17 +719,21 @@ uv run python manage.py runserver
 5. **Special events** require direct URL submission and are not included in multi-submit.
 6. **Duplicate detection**: same normalized email + title + same (meetup, event) target = blocked, all-or-nothing.
    Same talk to different meetups = allowed.
+   Withdrawn rows do not count as duplicates.
 7. **Withdrawal** is per-meetup; the speaker chooses which meetups to withdraw from, any status except Presented/Withdrawn.
 8. **Branding** cascades: org → meetup (override optional).
 9. **CFP windows**: default is year-round.
    Can be time-boxed per meetup.
    Events are always time-boxed.
+   Submit-time validation honors a per-target `grace_period_minutes` (default 0) past the close date.
 10. **Deactivated meetups** retain data, hidden from public (404), stop accepting submissions.
 11. **Archived events** retain data, stop accepting submissions, show archived status.
 12. **No automated emails**; all communication happens outside the platform.
     "Mark Email Sent" is a status transition only.
-13. **File uploads** are stored on a local volume and served only through the authenticated media view (nginx `X-Accel-Redirect`).
+13. **File uploads** are stored on a local volume; headshots are served publicly, everything else only through the authenticated media view (nginx `X-Accel-Redirect`).
 14. **Status transitions** follow the normative table; anything else is a validation error, and every applied transition writes an audit row.
+15. **Workflow-owned lifecycle**: one Temporal `SubmissionLifecycleWorkflow` per submission-meetup owns the state machine; transitions are workflow Updates and PostgreSQL mirrors status as the read model.
+16. **Webhooks**: a meetup with `webhook_url` set receives `submission.received` and every status change as a signed JSON POST, retried with backoff, never blocking the transition.
 
 ## Testable Business Logic Components
 
@@ -638,11 +744,12 @@ Each bullet is phrased so a failing test can encode it.
 
 - Global required field enforcement (missing field re-renders with error, creates nothing).
 - Per-meetup required optional-field and custom-question enforcement, including the "required if any selected meetup requires it" union rule.
-- Duplicate detection: normalized (email, title, meetup, event) blocks; different meetup or event passes.
+- Duplicate detection: normalized (email, title, meetup, event) blocks; different meetup or event passes; a withdrawn row does not block re-submission.
 - CAPTCHA validation failure preserves non-file input and creates nothing.
 - CFP window enforcement: submission to a closed/deactivated/archived target is rejected all-or-nothing, even when it was open at render time.
+- Grace period: a submission arriving after `cfp_close_date` but within `grace_period_minutes` is accepted; past the grace window it is rejected.
 - File upload limits: oversize or wrong-type file rejects with field-level error.
-- Success path creates Submission, SubmissionMeetup, SubmissionFieldResponse, and FileUpload rows in one transaction.
+- Success path: the intake workflow creates Submission, SubmissionMeetup, SubmissionFieldResponse, and FileUpload rows in one transaction and starts one lifecycle workflow per target.
 
 ### Dynamic Form Assembly
 
@@ -658,11 +765,12 @@ Each bullet is phrased so a failing test can encode it.
 - Super-admin bypass (access to everything).
 - Role assignment matrix: each role can assign only the roles listed for it, never at or above its own rank.
 - Action-level checks: who can vote, who can change status, who can edit meetup settings, who can export.
-- Media view access: unauthenticated redirect, no-role 403, qualifying role 200.
+- Media view access: headshot files 200 without auth; other files: unauthenticated redirect, no-role 403, qualifying role 200.
 
 ### Status Transitions
 
 - Every transition in the normative table succeeds; every transition not in it is rejected without side effects.
+- The update validator rejects an illegal transition before it enters workflow history; the caller gets the error synchronously and no audit row is written.
 - Audit log creation on every applied transition, including bulk and speaker withdrawal (null `changed_by`).
 - `scheduled_date` required when moving to "Scheduled"; cleared when unscheduling.
 
@@ -694,15 +802,29 @@ Each bullet is phrased so a failing test can encode it.
 - Permission checks on bulk operations.
 - Audit log entries created for each individual change in bulk.
 
+### Lifecycle Workflows (Temporal)
+
+Tested with the SDK's time-skipping `WorkflowEnvironment` and mocked activities.
+
+- Intake workflow persists all records via one activity, then starts one lifecycle workflow per target.
+- Deterministic workflow IDs: a duplicate intake or lifecycle start is a no-op.
+- `request_transition` Update: legal transitions execute the status-write and webhook activities; illegal ones are rejected by the validator.
+- Terminal statuses (Presented, Withdrawn) complete the workflow.
+
+### Webhook Delivery
+
+- Correct payload shape and event type for `submission.received` and `submission.status_changed`.
+- HMAC-SHA256 signature header present exactly when `webhook_secret` is set.
+- Delivery failure retries with backoff and never blocks or rolls back the transition.
+- No delivery attempted when `webhook_url` is unset.
+
 ## Open Questions
 
 For /bpe:brainstorm review.
 Where the spec now states a default, the default is what gets built unless overridden here.
 
-1. Alpine.js is in the stack but its only assigned jobs (Select All, collapsible groups, file-input notice) may be doable with HTMX plus a few lines of vanilla JS.
-   Keep it or drop it?
-2. Uploaded media is now specified as auth-gated via `X-Accel-Redirect` (organizers only).
-   Is that right, or should headshots be publicly fetchable for embedding in meetup announcement tooling?
+1. **Resolved**: keep Alpine.js in the stack.
+2. **Resolved**: headshots are publicly fetchable; all other uploads stay auth-gated via `X-Accel-Redirect`.
 3. Should the public forms get rate limiting beyond CAPTCHA (e.g., `django-ratelimit` per-IP on POST endpoints)?
 4. The spec now lets super-admins create additional non-core global fields (stored in `SubmissionFieldResponse`).
    If global field management should instead be limited to relabeling/reordering the six core fields, the `global_field` FK and `is_core` flag can be dropped.
@@ -710,12 +832,9 @@ Where the spec now states a default, the default is what gets built unless overr
    Confirm or adjust.
 6. Speakers currently cannot edit a submission after the fact; the token URL only withdraws.
    Should the withdrawal token also allow editing responses, or is withdraw-and-resubmit acceptable?
-7. Withdrawn rows still count as duplicates, so a speaker cannot re-submit the same title to the same target after withdrawing.
-   Intended, or should withdrawn rows be excluded from the duplicate check?
+7. **Resolved**: withdrawn rows are excluded from the duplicate check so speakers can withdraw and re-submit without organizer involvement.
 8. Data retention: is there a need to hard-delete a speaker's submissions and files on request (email in, purge out), and who can do it (super-admin only?)?
-9. Django version: the spec pins 5.2 LTS (supported until April 2028).
-   Django 6.0 shipped December 2025 and allauth 65.x supports it.
-   Stay on LTS or start on 6.0?
+9. **Resolved**: build on Django 6.0.
 10. PostgreSQL 16 is specified; 17 is current and 16 is fine until November 2028.
     Any reason to bump before starting?
 11. The org-wide `TIME_ZONE` drives CFP window display and "this month"/"upcoming" math.
