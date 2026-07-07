@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+/* Reusable custom utilities. */
+@import "./utils/gradients.css";
+
+/* Scan project templates and JS for utility classes. django-tailwind-cli also
+   auto-registers Django template dirs, but these keep detection explicit. */
+@source "../../templates/**/*.html";
+@source "../../**/templates/**/*.html";
+@source "../js/**/*.js";
+
+/* Hide Alpine-cloaked elements until Alpine initializes. */
+[x-cloak] { display: none !important; }

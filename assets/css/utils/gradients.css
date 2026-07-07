@@ -1,0 +1,17 @@
+/*
+ * Reusable gradient utilities.
+ *
+ * Defined as Tailwind v4 `@utility` rules so they can be used like any other
+ * utility class (e.g. `class="gradient-python"`) and composed with variants
+ * (`hover:`, `md:`, etc.). Imported by ../source.css.
+ */
+
+/* Python logo: deep blue -> light blue -> yellow, on the main diagonal. */
+@utility gradient-python {
+  background-image: linear-gradient(to bottom right, #306998, #4b8bbe, #ffd43b);
+}
+
+/* Subtler blue-only wash for secondary surfaces. */
+@utility gradient-python-blue {
+  background-image: linear-gradient(to bottom right, #306998, #4b8bbe);
+}

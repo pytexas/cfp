@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}meetup-cfp{% endblock %}
+
+{% block content %}
+{# `gradient-python` is a reusable utility (assets/css/utils/gradients.css); navbar comes from base.html, so this block is just the hero. #}
+<main class="flex flex-1 flex-col items-center justify-center gradient-python px-6 py-24 text-center text-white sm:py-32">
+  <div class="max-w-3xl">
+    <h1 class="text-4xl font-extrabold tracking-tight drop-shadow-sm sm:text-6xl">
+      Share your talk with the community
+    </h1>
+    <p class="mx-auto mt-6 max-w-xl text-lg text-white/90">
+      Submit a proposal to one or more meetups in a single form. Organizers review,
+      track, and schedule — you just bring the ideas.
+    </p>
+    <div class="mt-10 flex flex-wrap items-center justify-center gap-4">
+      <a href="#" class="rounded-full bg-white px-6 py-3 font-semibold text-[#306998] shadow-md transition hover:bg-white/90">
+        Get started
+      </a>
+      <a href="#" class="rounded-full border border-white/70 px-6 py-3 font-semibold text-white transition hover:bg-white/10">
+        Browse meetups
+      </a>
+    </div>
+  </div>
+</main>
+{% endblock %}

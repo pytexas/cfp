@@ -1,0 +1,35 @@
+{# Reusable site navigation. Rendered by base.html on every page; `nav_links` is supplied by the `navigation` context processor. #}
+<header x-data="{ open: false }" class="gradient-python-blue text-white shadow-sm">
+  <nav class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+    <a href="{% url 'home' %}" class="text-lg font-bold tracking-tight">meetup<span class="text-[#FFD43B]">-cfp</span></a>
+
+    {# Desktop links #}
+    <ul class="hidden items-center gap-8 text-sm font-medium md:flex">
+      {% for label in nav_links %}
+      <li>
+        <a href="#" class="text-white/90 transition hover:text-white hover:underline underline-offset-4">{{ label }}</a>
+      </li>
+      {% endfor %}
+    </ul>
+
+    <a href="#" class="hidden rounded-full bg-white px-4 py-2 text-sm font-semibold text-[#306998] shadow-sm transition hover:bg-white/90 md:inline-block">
+      Submit a talk
+    </a>
+
+    {# Mobile toggle #}
+    <button type="button" @click="open = !open" class="md:hidden" aria-label="Toggle menu">
+      <svg class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <path x-show="!open" stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16" />
+        <path x-show="open" x-cloak stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+      </svg>
+    </button>
+  </nav>
+
+  {# Mobile links #}
+  <ul x-show="open" x-cloak class="space-y-1 px-6 pb-4 md:hidden">
+    {% for label in nav_links %}
+    <li><a href="#" class="block rounded-md px-3 py-2 text-sm font-medium text-white/90 hover:bg-white/10">{{ label }}</a></li>
+    {% endfor %}
+    <li><a href="#" class="mt-2 block rounded-md bg-white px-3 py-2 text-center text-sm font-semibold text-[#306998]">Submit a talk</a></li>
+  </ul>
+</header>

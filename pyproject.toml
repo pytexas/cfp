@@ -1,0 +1,49 @@
+[project]
+name = "meetup-cfp"
+version = "0.1.0"
+description = "Multi-meetup Call for Proposals platform"
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.0",
+    "django-allauth",
+    "django-tailwind-cli",
+    "django-htmx",
+    "gunicorn",
+    "psycopg[binary]",
+    "whitenoise",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-django",
+    "factory-boy",
+    "ruff",
+    "mypy",
+    "django-stubs",
+    "coverage",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["core", "meetups", "submissions", "reviews", "users", "dashboard", "meetup_cfp"]
+
+[tool.mypy]
+python_version = "3.12"
+strict_optional = true
+warn_unused_ignores = true
+plugins = ["mypy_django_plugin.main"]
+
+[tool.django-stubs]
+django_settings_module = "meetup_cfp.settings.dev"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "meetup_cfp.settings.dev"
+pythonpath = ["."]
+python_files = ["test_*.py"]
