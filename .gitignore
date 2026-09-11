@@ -208,3 +208,6 @@ __marimo__/
 
 # Claude Code commit workflow
 commit-msg.md
+
+# BPE goal loop working file (written by /bpe:goal, inlined via /goal @goal.md)
+goal.md

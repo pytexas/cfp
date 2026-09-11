@@ -16,6 +16,11 @@ See the Temporal Architecture section.
 This is a Django/Python project.
 All Python work in this repo uses the `python:python` skill: uv for package and environment management, ruff for linting and formatting, mypy for type checking, pytest for tests, strict type hints, and TDD for application code.
 
+**Verification command:** just check
+
+The `just check` recipe (ruff, format check, mypy, pytest) is created in Step 1 and is the per-step and completion gate for the autonomous BPE run.
+Before Step 1 there is no manifest to autodetect, so the goal loop reads this field.
+
 ## Tech Stack
 
 | Layer | Technology |
